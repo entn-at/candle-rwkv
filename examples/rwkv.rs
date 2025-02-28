@@ -11,17 +11,22 @@ use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
+// use tokenizers::Tokenizer as PileTokenizer;
 
 use candle_rwkv::models::quantized::rwkv5::Model as Q5;
 use candle_rwkv::models::quantized::rwkv6::Model as Q6;
-use candle_rwkv::models::rwkv5::{Config, Model as M5, State, Tokenizer};
+use candle_rwkv::models::quantized::rwkv7::Model as Q7;
+use candle_rwkv::models::rwkv5::{Config, Model as M5, State, Tokenizer as WorldTokenizer};
 use candle_rwkv::models::rwkv6::Model as M6;
+use candle_rwkv::models::rwkv7::Model as M7;
 
 enum Model {
     M5(M5),
     Q5(Q5),
     M6(M6),
     Q6(Q6),
+    M7(M7),
+    Q7(Q7),
 }
 
 impl Model {
@@ -31,6 +36,29 @@ impl Model {
             Self::Q5(m) => m.forward(xs, state),
             Self::M6(m) => m.forward(xs, state),
             Self::Q6(m) => m.forward(xs, state),
+            Self::M7(m) => m.forward(xs, state),
+            Self::Q7(m) => m.forward(xs, state),
+        }
+    }
+}
+
+enum Tokenizer {
+    // Pile(PileTokenizer),
+    World(WorldTokenizer),
+}
+
+impl Tokenizer {
+    fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        match self {
+            // Self::Pile(t) => Ok(t.encode(text, true).unwrap().get_ids().to_vec()),
+            Self::World(t) => Ok(t.encode(text)?),
+        }
+    }
+
+    fn decode(&self, ids: &[u32]) -> Result<String> {
+        match self {
+            // Self::Pile(t) => Ok(t.decode(ids, true).unwrap()),
+            Self::World(t) => Ok(t.decode(ids)?),
         }
     }
 }
@@ -129,10 +157,10 @@ impl TextGeneration {
 
 #[derive(Parser, ValueEnum, Clone, Copy, PartialEq, Eq, Debug)]
 enum Which {
-    World1b5,
-    World6_1b6,
-    World6_3b,
-    World6_7b,
+    V7_0b4,
+    V6_1b6,
+    V6_3b,
+    V5_1b5,
 }
 
 impl std::fmt::Display for Which {
@@ -144,14 +172,24 @@ impl std::fmt::Display for Which {
 impl Which {
     fn model_id(&self) -> &'static str {
         match self {
-            Self::World1b5 => "RWKV/rwkv-5-world-1b5",
-            _ => "paperfun/rwkv",
+            Self::V7_0b4 => "paperfun/rwkv-x070-world-0b4",
+            Self::V6_1b6 => "paperfun/rwkv-x060-world-1b6",
+            Self::V6_3b => "paperfun/rwkv-x060-world-3b",
+            Self::V5_1b5 => "RWKV/rwkv-5-world-1b5",
+        }
+    }
+
+    fn state_id(&self) -> &'static str {
+        match self {
+            Self::V6_1b6 => "paperfun/rwkv-x060-1b6-state",
+            Self::V6_3b => "paperfun/rwkv-x060-3b-state",
+            _ => panic!("no state for {:?}", self),
         }
     }
 
     fn revision(&self) -> &'static str {
         match self {
-            Self::World1b5 => "refs/pr/2",
+            Self::V5_1b5 => "refs/pr/2",
             _ => "main",
         }
     }
@@ -187,14 +225,14 @@ struct Args {
     #[arg(long, short = 'n', default_value_t = 5000)]
     sample_len: usize,
 
-    #[arg(long, default_value = "world1b5")]
+    #[arg(long, default_value = "v6-1b6")]
     which: Which,
 
     #[arg(long)]
     weight_files: Option<String>,
 
     #[arg(long)]
-    state_files: Option<String>,
+    state_file: Option<String>,
 
     #[arg(long)]
     config_file: Option<String>,
@@ -247,16 +285,15 @@ fn main() -> Result<()> {
         RepoType::Model,
         args.which.revision().to_string(),
     ));
-    let tokenizer = api
-        .model("lmz/candle-rwkv".to_string())
-        .get("rwkv_vocab_v20230424.json")?;
+    let tokenizer_filename = match args.which {
+        Which::V5_1b5 => api
+            .model("lmz/candle-rwkv".to_string())
+            .get("rwkv_vocab_v20230424.json")?,
+        _ => repo.get("tokenizer.json")?,
+    };
     let config_filename = match args.config_file {
         Some(file) => std::path::PathBuf::from(file),
-        None => match args.which {
-            Which::World1b5 | Which::World6_1b6 => repo.get("config.json")?,
-            Which::World6_3b => repo.get("config_3b.json")?,
-            Which::World6_7b => repo.get("config_7b.json")?,
-        },
+        None => repo.get("config.json")?,
     };
     let filenames = match args.weight_files {
         Some(files) => files
@@ -266,39 +303,25 @@ fn main() -> Result<()> {
         None => {
             if args.quantized {
                 let file = match args.which {
-                    Which::World1b5 => api
+                    Which::V5_1b5 => api
                         .model("lmz/candle-rwkv".to_string())
                         .get("world1b5-q4k.gguf")?,
-                    Which::World6_1b6 => {
-                        repo.get("RWKV-x060-World-1B6-v2.1-20240328-ctx4096-q4k.gguf")?
-                    }
-                    Which::World6_3b => {
-                        repo.get("RWKV-x060-World-3B-v2.1-20240417-ctx4096-q4k.gguf")?
-                    }
-                    Which::World6_7b => {
-                        repo.get("RWKV-x060-World-7B-v2.1-20240507-ctx4096-q4k.gguf")?
-                    }
+                    _ => repo.get("model.q4k.gguf")?,
                 };
                 vec![file]
             } else {
-                let file = match args.which {
-                    Which::World1b5 => repo.get("model.safetensors")?,
-                    Which::World6_1b6 => {
-                        repo.get("RWKV-x060-World-1B6-v2.1-20240328-ctx4096.safetensors")?
-                    }
-                    Which::World6_3b => {
-                        repo.get("RWKV-x060-World-3B-v2.1-20240417-ctx4096.safetensors")?
-                    }
-                    Which::World6_7b => {
-                        repo.get("RWKV-x060-World-7B-v2.1-20240507-ctx4096.safetensors")?
-                    }
-                };
+                let file = repo.get("model.safetensors")?;
                 vec![file]
             }
         }
     };
     println!("retrieved the weight files in {:?}", start.elapsed());
-    let tokenizer = Tokenizer::new(tokenizer)?;
+    let tokenizer = match args.which {
+        // Which::V7_173m => {
+        //     Tokenizer::Pile(PileTokenizer::from_file(tokenizer_filename).unwrap())
+        // }
+        _ => Tokenizer::World(WorldTokenizer::new(tokenizer_filename)?),
+    };
 
     let start = std::time::Instant::now();
     let config: Config = serde_json::from_slice(&std::fs::read(config_filename)?)?;
@@ -314,43 +337,43 @@ fn main() -> Result<()> {
         let vb =
             candle_transformers::quantized_var_builder::VarBuilder::from_gguf(filename, &device)?;
         match args.which {
-            Which::World1b5 => Model::Q5(Q5::new(&config, vb)?),
-            _ => Model::Q6(Q6::new(&config, vb)?),
+            Which::V7_0b4 => Model::Q7(Q7::new(&config, vb)?),
+            Which::V6_1b6 | Which::V6_3b => Model::Q6(Q6::new(&config, vb)?),
+            Which::V5_1b5 => Model::Q5(Q5::new(&config, vb)?),
         }
     } else {
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, DType::F32, &device)? };
         match args.which {
-            Which::World1b5 => Model::M5(M5::new(&config, vb)?),
-            _ => Model::M6(M6::new(&config, vb)?),
+            Which::V7_0b4 => Model::M7(M7::new(&config, vb)?),
+            Which::V6_1b6 | Which::V6_3b => Model::M6(M6::new(&config, vb)?),
+            Which::V5_1b5 => Model::M5(M5::new(&config, vb)?),
         }
     };
     println!("loaded the model on {:?} in {:?}", &device, start.elapsed());
 
     let start = std::time::Instant::now();
-    let state_file = match args.state_files {
-        Some(files) => Some(files.into()),
-        None => {
-            if args.state_tuned {
-                match args.which {
-                    Which::World6_1b6 => Some(
-                        repo.get("rwkv-x060-chn_single_round_qa-1B6-20240516-ctx2048.safetensors")?,
-                    ),
-                    Which::World6_3b => Some(
-                        repo.get("rwkv-x060-chn_single_round_qa-3B-20240516-ctx2048.safetensors")?,
-                    ),
-                    Which::World6_7b => Some(
-                        repo.get("rwkv-x060-chn_single_round_qa-7B-20240516-ctx2048.safetensors")?,
-                    ),
-                    _ => None,
+    let state_file =
+        match args.state_file {
+            Some(files) => Some(files.into()),
+            None => {
+                if args.state_tuned {
+                    match args.which {
+                        Which::V6_1b6 => Some(api.model(args.which.state_id().to_string()).get(
+                            "rwkv-x060-chn_single_round_qa-1B6-20240516-ctx2048.safetensors",
+                        )?),
+                        Which::V6_3b => Some(api.model(args.which.state_id().to_string()).get(
+                            "rwkv-x060-chn_single_round_qa-3B-20240516-ctx2048.safetensors",
+                        )?),
+                        _ => None,
+                    }
+                } else {
+                    None
                 }
-            } else {
-                None
             }
-        }
-    };
+        };
 
     if !state_file.is_none() {
-        println!("retrieved the state files in {:?}", start.elapsed());
+        println!("retrieved the state file in {:?}", start.elapsed());
     }
 
     // state files are small, no need to quantize

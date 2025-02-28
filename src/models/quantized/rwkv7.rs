@@ -7,26 +7,37 @@ use candle_transformers::{
 
 pub use crate::models::rwkv5::{Config, State, Tokenizer};
 
+fn softplus(xs: &Tensor) -> Result<Tensor> {
+    (xs.exp()? + 1.0)?.log()
+}
+
 #[derive(Debug, Clone)]
 struct SelfAttention {
-    key: Linear,
-    receptance: Linear,
-    value: Linear,
-    gate: Linear,
-    output: Linear,
-    ln_x: candle_nn::GroupNorm,
     time_mix_x: Tensor,
+    time_mix_r: Tensor,
     time_mix_w: Tensor,
     time_mix_k: Tensor,
     time_mix_v: Tensor,
-    time_mix_r: Tensor,
+    time_mix_a: Tensor,
     time_mix_g: Tensor,
     time_decay: Tensor,
     time_faaaa: Tensor,
-    time_decay_w1: Tensor,
-    time_decay_w2: Tensor,
+    time_aaaaa: Tensor,
     time_mix_w1: Tensor,
     time_mix_w2: Tensor,
+    time_decay_w1: Tensor,
+    time_decay_w2: Tensor,
+    time_aaa_w1: Tensor,
+    time_aaa_w2: Tensor,
+    time_kkk_w1: Tensor,
+    time_kkk_w2: Tensor,
+    gate_w1: Tensor,
+    gate_w2: Tensor,
+    receptance: Linear,
+    key: Linear,
+    value: Linear,
+    output: Linear,
+    ln_x: candle_nn::GroupNorm,
     layer_id: usize,
     n_attn_heads: usize,
 }
@@ -38,7 +49,6 @@ impl SelfAttention {
         let key = linear(hidden_size, attn_hidden_size, vb.pp("key"))?;
         let receptance = linear(hidden_size, attn_hidden_size, vb.pp("receptance"))?;
         let value = linear(hidden_size, attn_hidden_size, vb.pp("value"))?;
-        let gate = linear(hidden_size, attn_hidden_size, vb.pp("gate"))?;
         let output = linear(attn_hidden_size, hidden_size, vb.pp("output"))?;
 
         let vb_x = vb.pp("ln_x");
@@ -65,6 +75,9 @@ impl SelfAttention {
         let time_mix_v = vb
             .get((1, 1, cfg.hidden_size), "time_mix_v")?
             .dequantize(vb.device())?;
+        let time_mix_a = vb
+            .get((1, 1, cfg.hidden_size), "time_mix_a")?
+            .dequantize(vb.device())?;
         let time_mix_r = vb
             .get((1, 1, cfg.hidden_size), "time_mix_r")?
             .dequantize(vb.device())?;
@@ -76,7 +89,13 @@ impl SelfAttention {
             .get((1, 1, cfg.hidden_size), "time_decay")?
             .dequantize(vb.device())?;
         let time_faaaa = vb
-            .get((n_attn_heads, cfg.head_size), "time_faaaa")?
+            .get(
+                (1, 1, cfg.hidden_size / cfg.head_size, cfg.head_size),
+                "time_faaaa",
+            )?
+            .dequantize(vb.device())?;
+        let time_aaaaa = vb
+            .get((1, 1, cfg.hidden_size), "time_aaaaa")?
             .dequantize(vb.device())?;
         // for 7B, hidden size 4096 dim is different
         let time_decay_w1 = vb
@@ -110,9 +129,9 @@ impl SelfAttention {
                 (
                     cfg.hidden_size,
                     if cfg.hidden_size == 4096 {
-                        cfg.head_size * 5
+                        cfg.head_size * 6
                     } else {
-                        cfg.head_size * 5 / 2
+                        cfg.head_size * 6 / 2
                     },
                 ),
                 "time_mix_w1",
@@ -121,7 +140,7 @@ impl SelfAttention {
         let time_mix_w2 = vb
             .get(
                 (
-                    5,
+                    6,
                     if cfg.hidden_size == 4096 {
                         cfg.head_size
                     } else {
@@ -132,25 +151,51 @@ impl SelfAttention {
                 "time_mix_w2",
             )?
             .dequantize(vb.device())?;
+
+        let time_aaa_w1 = vb
+            .get((cfg.hidden_size, cfg.head_size), "time_aaa_w1")?
+            .dequantize(vb.device())?;
+        let time_aaa_w2 = vb
+            .get((cfg.head_size, cfg.hidden_size), "time_aaa_w2")?
+            .dequantize(vb.device())?;
+        let time_kkk_w1 = vb
+            .get((cfg.hidden_size, cfg.head_size), "time_kkk_w1")?
+            .dequantize(vb.device())?;
+        let time_kkk_w2 = vb
+            .get((cfg.head_size, cfg.hidden_size), "time_kkk_w2")?
+            .dequantize(vb.device())?;
+        let gate_w1 = vb
+            .get((cfg.hidden_size, cfg.head_size * 2), "gate_w1")?
+            .dequantize(vb.device())?;
+        let gate_w2 = vb
+            .get((cfg.head_size * 2, cfg.hidden_size), "gate_w2")?
+            .dequantize(vb.device())?;
         Ok(Self {
             key,
             value,
             receptance,
-            gate,
             output,
             ln_x,
             time_mix_x,
             time_mix_w,
             time_mix_k,
             time_mix_v,
+            time_mix_a,
             time_mix_r,
-            time_mix_g,
             time_decay,
             time_faaaa,
+            time_aaaaa,
+            time_mix_g,
             time_decay_w1,
             time_decay_w2,
             time_mix_w1,
             time_mix_w2,
+            time_aaa_w1,
+            time_aaa_w2,
+            time_kkk_w1,
+            time_kkk_w2,
+            gate_w1,
+            gate_w2,
             layer_id,
             n_attn_heads,
         })
@@ -160,78 +205,116 @@ impl SelfAttention {
         let h = self.n_attn_heads;
         let (b, t, s) = xs.dims3()?;
         let s = s / h;
-        let (receptance, key, value, gate, w) = {
-            // extract key-value
-            let shifted = state.per_layer[self.layer_id].extract_key_value.clone();
-            let shifted = if shifted.rank() == 2 {
-                shifted.unsqueeze(1)?
-            } else {
-                shifted
-            };
 
-            let sx = (&shifted - xs)?;
-            let xxx = (xs + &sx * &self.time_mix_x)?;
-            let xxx = xxx
-                .broadcast_matmul(&self.time_mix_w1)?
-                .tanh()?
-                .reshape((b * t, 5, ()))?
-                .transpose(0, 1)?;
+        // extract key-value
+        let shifted = state.per_layer[self.layer_id].extract_key_value.clone();
+        let shifted = if shifted.rank() == 2 {
+            shifted.unsqueeze(1)?
+        } else {
+            shifted
+        };
 
-            let xxx = xxx.matmul(&self.time_mix_w2)?.reshape((5, b, t, ()))?;
+        let xx = (&shifted - xs)?;
+        let xxx = (xs + &xx * &self.time_mix_x)?;
+        let xxx = xxx
+            .broadcast_matmul(&self.time_mix_w1)?
+            .tanh()?
+            .reshape((b * t, 6, ()))?
+            .transpose(0, 1)?;
+        let xxx = xxx.matmul(&self.time_mix_w2)?.reshape((6, b, t, ()))?;
 
-            let (mw, mk, mv, mr, mg) = (xxx.i(0)?, xxx.i(1)?, xxx.i(2)?, xxx.i(3)?, xxx.i(4)?);
+        let (mr, mw, mk, mv, ma, mg) = (
+            xxx.i(0)?,
+            xxx.i(1)?,
+            xxx.i(2)?,
+            xxx.i(3)?,
+            xxx.i(4)?,
+            xxx.i(5)?,
+        );
 
-            let xw = (xs + &sx * (&self.time_mix_w + &mw)?)?;
-            let xk = (xs + &sx * (&self.time_mix_k + &mk)?)?;
-            let xv = (xs + &sx * (&self.time_mix_v + &mv)?)?;
-            let xr = (xs + &sx * (&self.time_mix_r + &mr)?)?;
-            let xg = (xs + &sx * (&self.time_mix_g + &mg)?)?;
+        let xr = (xs + &xx * (&self.time_mix_r + &mr)?)?;
+        let xw = (xs + &xx * (&self.time_mix_w + &mw)?)?;
+        let xk = (xs + &xx * (&self.time_mix_k + &mk)?)?;
+        let xv = (xs + &xx * (&self.time_mix_v + &mv)?)?;
+        let xa = (xs + &xx * (&self.time_mix_a + &ma)?)?;
+        let xg = (xs + &xx * (&self.time_mix_g + &mg)?)?;
 
-            // dbg!(&xw, &xk, &xv, &xr, &xg);
-            let w = (&self.time_decay
+        let r = self.receptance.forward(&xr)?;
+        let w = (softplus(
+            &(&self.time_decay
                 + xw.broadcast_matmul(&self.time_decay_w1)?
                     .tanh()?
                     .broadcast_matmul(&self.time_decay_w2)?)?
-            .reshape(((), 1, 1))?
-            .reshape((self.n_attn_heads, (), 1))?;
+            .neg()?,
+        )?
+        .neg()?
+            - 0.5)?;
+        let k = self.key.forward(&xk)?;
+        let v = self.value.forward(&xv)?;
+        let g = xg
+            .broadcast_matmul(&self.gate_w1)?
+            .tanh()?
+            .broadcast_matmul(&self.gate_w2)?;
 
-            // dbg!(&weight);
+        let kk = (&k
+            + xk.broadcast_matmul(&self.time_kkk_w1)?
+                .tanh()?
+                .broadcast_matmul(&self.time_kkk_w2)?)?;
+        // let kk = normalize() TODO:
 
-            let key = self.key.forward(&xk)?;
-            let value = self.value.forward(&xv)?;
-            let receptance = self.receptance.forward(&xr)?;
-            let gate = candle_nn::ops::silu(&self.gate.forward(&xg)?)?;
-            state.per_layer[self.layer_id].extract_key_value = xs.i((.., t - 1))?;
-            (receptance, key, value, gate, w)
-        };
-        // dbg!(&xs, &receptance, &key, &value, &gate, &weight);
+        let a = candle_nn::ops::sigmoid(
+            &(self.time_aaaaa.clone()
+                + xa.broadcast_matmul(&self.time_aaa_w1)?
+                    .broadcast_matmul(&self.time_aaa_w2)?
+                    * 2.0)?,
+        )?;
+
+        let k = (&k * (&w * 0.5)?.maximum(0.0)?.exp()?)?;
+
+        // x = RUN_CUDA_RWKV7(r, w, k, v, -kk, kk*a)
+
+        state.per_layer[self.layer_id].extract_key_value = xs.i((.., t - 1))?;
+
         // linear attention
         let mut state_ = state.per_layer[self.layer_id].linear_attention.clone();
-        let key = key.reshape((b, t, h, s))?.permute((0, 2, 3, 1))?;
-        let value = value.reshape((b, t, h, s))?.transpose(1, 2)?;
-        let receptance = receptance.reshape((b, t, h, s))?.transpose(1, 2)?;
-
+        let k = k.reshape((b, t, h, s))?.permute((0, 2, 3, 1))?;
+        let v = v.reshape((b, t, h, s))?.transpose(1, 2)?;
+        let r = r.reshape((b, t, h, s))?.transpose(1, 2)?;
         let w = w.exp()?.neg()?.exp()?;
+
+        dbg!(&w);
 
         let time_faaaa =
             self.time_faaaa
                 .reshape(((), 1, 1))?
                 .reshape((self.n_attn_heads, (), 1))?;
 
+        dbg!(&time_faaaa);
+
         let mut out: Vec<Tensor> = Vec::with_capacity(t);
         for t_ in 0..t {
-            let rt = receptance.i((.., .., t_..t_ + 1))?.contiguous()?;
-            let kt = key.i((.., .., .., t_..t_ + 1))?.contiguous()?;
-            let vt = value.i((.., .., t_..t_ + 1))?.contiguous()?;
+            let rt = r.i((.., .., t_..t_ + 1))?.contiguous()?;
+            let kt = k.i((.., .., .., t_..t_ + 1))?.contiguous()?;
+            let vt = v.i((.., .., t_..t_ + 1))?.contiguous()?;
             let at = kt.matmul(&vt)?;
             let rhs = (time_faaaa.broadcast_mul(&at)? + &state_)?;
             let out_ = rt.matmul(&rhs)?.squeeze(2)?;
-            state_ = (&at + w.broadcast_mul(&state_))?;
+            dbg!(&out_);
+            // state_ = (&at + w.broadcast_mul(&state_))?;
+            // dbg!(&state_);
             out.push(out_)
         }
+
         let out = Tensor::cat(&out, 1)?.reshape((b * t, h * s, 1))?;
         let out = out.apply(&self.ln_x)?.reshape((b, t, h * s))?;
-        let out = (out * gate)?.apply(&self.output)?;
+
+        dbg!(&out);
+        // x = x + ((r.view(B,T,H,-1)*k.view(B,T,H,-1)*self.time_faaaa).sum(dim=-1, keepdim=True) * v.view(B,T,H,-1)).view(B,T,C)
+        let out = (out
+            + (r.reshape((b, t, h, ()))?
+                .matmul(&k.reshape((b, t, h, ()))?)?
+                .matmul(&self.time_faaaa)?))?;
+        let out = (out * g)?.apply(&self.output)?;
         state.per_layer[self.layer_id].linear_attention = state_;
         Ok(out)
     }
