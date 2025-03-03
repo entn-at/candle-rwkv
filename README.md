@@ -12,7 +12,7 @@ If you just want to have a try. Run command below.
 
 ```bash
 # run rwkv7 (developing)
-cargo run --release --example rwkv -- --which "v7-173m" --prompt "User: why is the sky blue?\n\nAssistant: "
+cargo run --release --example rwkv -- --which "v7-0b4" --prompt "User: why is the sky blue?\n\nAssistant: "
 
 # run rwkv6
 cargo run --release --example rwkv -- --which "v6-3b" --prompt "User: 我在深圳，我要去埃及金字塔，我要怎么走?\n\nAssistant: "

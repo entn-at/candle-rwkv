@@ -141,16 +141,13 @@ impl SelfAttention {
         let a = candle_nn::ops::sigmoid(
             &(&self.a0 + xa.broadcast_matmul(&self.a1)?.broadcast_matmul(&self.a2)?)?,
         )?;
-        let kk = (k * &self.k_k)?;
+        let kk = (&k * &self.k_k)?;
         //
+        let k = (&k * (1.0 + ((a - 1.0)? * &self.k_a)?)?)?;
 
         let w = (&self.w0 + w)?;
-
-        Ok(Tensor::zeros(
-            (1, 1, 768),
-            candle::DType::F32,
-            &candle::Device::Cpu,
-        )?)
+        let w = (-0.606531 * candle_nn::ops::sigmoid(&w)?)?.exp()?;
+        Ok(w)
     }
 }
 
@@ -180,7 +177,6 @@ impl FeedForward {
         let xx = state.per_layer[self.layer_id]
             .feed_forward
             .broadcast_sub(xs)?;
-        let k = (xs + (&xx * &self.x_k)?)?;
         let k = (xs + &xx.broadcast_mul(&self.x_k)?)?;
         let k = (self.key.forward(&k)?).relu()?.powf(2.0)?;
         let xs = self.value.forward(&k)?;
